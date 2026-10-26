@@ -127,7 +127,8 @@ def backtest_rows(stats: dict[str, dict]) -> tuple[list[str], list[list[str]]]:
 
 
 def backtest_report(results: dict[str, Result],
-                    extra_tables: list[tuple[str, list[str], list[list[str]]]] | None = None) -> Report:
+                    extra_tables: list[tuple[str, list[str], list[list[str]]]] | None = None,
+                    taxes: dict[str, dict] | None = None, tax_rate: float | None = None) -> Report:
     any_res = next(iter(results.values()))
     start, end = any_res.equity.index[0], any_res.equity.index[-1]
     rep = Report(f"Backtest {start:%b %Y} – {end:%b %Y}")
@@ -141,6 +142,11 @@ def backtest_report(results: dict[str, Result],
     yr = yearly / yearly.shift(1).fillna(first) - 1
     rep.table("Calendar-year returns", ["Year"] + [STRATEGIES[k].name for k in yr.columns],
               [[str(y)] + [pct(v) for v in row] for y, row in yr.iterrows()])
+    if taxes:
+        rep.table(f"After-tax estimate (flat {tax_rate:.3%} on realized gains, German style; rough)",
+                  ["Strategy", "Tax paid", "$10k became after tax", "After-tax yearly (CAGR)"],
+                  [[STRATEGIES[k].name, usd(t["tax_paid"]), usd(t["after_tax_value"]), pct(t["after_tax_cagr"])]
+                   for k, t in taxes.items()])
     for caption, header, rows in extra_tables or []:
         rep.table(caption, header, rows)
     return rep

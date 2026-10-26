@@ -20,6 +20,7 @@ each month it emails a monthly summary. It runs on GitHub Actions, so your compu
 | `sixty_forty` | 60/40 (passive) | 60 % SPY, 40 % bonds (AGG) | Never |
 | `golden_cross_spy` | Golden cross | SPY while its 50-day average is above its 200-day average, else T-bills | A few times a year |
 | `mean_reversion_rsi2` | Mean reversion RSI(2) | Buy SPY after a sharp dip in an uptrend (RSI(2) below 10), sell when it closes above its 5-day average | Often: costs matter |
+| `multi_asset_momentum_vt` | **Multi-asset momentum, volatility-targeted** (default for paper orders) | The multi-asset strategy with position size scaled to a 10 % volatility target; the lowest-drawdown active strategy in the backtest | Monthly, plus rare size changes |
 | `multi_asset_momentum` | **Multi-asset momentum** | At each month-end: rank SPY, QQQ, EFA, EEM (emerging markets), GLD (gold), TLT (long bonds) by 12-month return; hold the best two that beat T-bills, equal-weighted; anything left in BIL | Up to monthly |
 
 Why these strategies:
@@ -44,6 +45,21 @@ Every active strategy runs with the same risk overlay, configured in `[stops]` o
 The passive allocations (benchmark, Buffett 90/10, 60/40) deliberately get no stops: their whole point is to hold through everything, and they show you what the rules cost or save. The backtest's sensitivity table also runs the trend strategy with stops of 5 to 30 % and breakers of 10 to 30 %, so you can see whether a given stop level helps or hurts over 20 years; stops often reduce the worst drawdown and cost a little return, which is a trade you choose consciously.
 
 About Warren Buffett: he is not a trader. He buys businesses and holds them for decades; no rule-based bot copies that judgment. The nearest thing is his own advice for private investors, which is in the table above as `buffett_90_10`, and it is a benchmark every active strategy has to beat.
+
+## Weaknesses that were fixed, and the ones that cannot be
+
+| Weakness | What the bot now does |
+|---|---|
+| Whipsaws in trend rules | Hysteresis band (2 %) and 3-day confirmation before a switch (`[trend]`); the backtest's sensitivity table shows what each setting costs or saves |
+| Stops in the simulation behaved differently from the broker's | The simulation trails on daily highs and triggers on daily lows, like Alpaca's trailing stop |
+| Fills assumed at the close | Trades are simulated at the next day's open, which is when a broker fills an order placed after the close |
+| One ETF at a time, 100 % in | Default paper strategy is the diversified, volatility-targeted multi-asset momentum; a deadband keeps its size changes rare |
+| Bad or stale data could trigger orders | Every daily and monitor run validates the data first (no implausible jumps, nothing older than a week); on failure it emails you and trades nothing |
+| A failed or skipped daily run | The 30-minute monitor compares the account with the strategy's target and places the missing orders when nothing is pending |
+| US ETFs are not sold to EU retail investors | `[universe]` maps each symbol to another ticker (e.g. UCITS ETFs on Xetra) for both data and orders |
+| Taxes were invisible | The backtest estimates the German flat tax on realized gains per strategy, so churn shows its true cost |
+
+What cannot be fixed by any code: overnight gaps (a stop fills at the next price, not at the stop level), a market regime nobody has seen, and judgment. Warren Buffett's edge is buying businesses he understands and holding for decades; his advice for everyone else is the passive 90/10 line in the table, which remains the bar every active strategy has to clear.
 
 What this does **not** do: produce a profit every month. No rule-based strategy can. The point of the extra tables below is to find out, with numbers, whether an edge is real before any real money is involved.
 
@@ -95,7 +111,7 @@ After that it runs on its own every trading day.
 ## Optional: Alpaca paper trading (real broker, fake money)
 
 The bot can also place orders in an Alpaca **paper** account for one strategy (`[broker] strategy` in
-`config.toml`, default `trend_qqq`). This tests real order handling with no risk.
+`config.toml`, default `multi_asset_momentum_vt`, the diversified, risk-sized one). This tests real order handling with no risk.
 
 1. Create a free account at https://alpaca.markets, switch to **Paper Trading**, and generate API keys. Paper keys start with `PK`.
 2. Add `ALPACA_KEY_ID` and `ALPACA_SECRET_KEY` as secrets in the `trading` environment.
@@ -136,6 +152,8 @@ Dependabot and Renovate updates count, so merging them keeps the bot running.
 **Live trading is intentionally not implemented.** Consider it only after at least 3–6 months of paper results that beat the benchmark. Even then, start with money you can afford to lose and an account with withdrawals disabled for the API.
 
 ## Run locally
+
+Python 3.12 is required (`tomllib`). On a Mac without it: `uv venv --python 3.12 .venv` (uv from astral.sh) instead of `python -m venv`.
 
 ```bash
 python -m venv .venv && source .venv/bin/activate

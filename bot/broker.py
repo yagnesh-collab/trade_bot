@@ -96,8 +96,12 @@ def equity_history(s: requests.Session) -> list[float]:
     return [float(v) for v in (h.get("equity") or []) if v is not None]
 
 
-def monitor(stop_pct: float, dd_limit: float | None, cooldown_days: int) -> dict:
-    """Market-hours check: re-create missing trailing stops; enforce the circuit breaker; report status."""
+def monitor(stop_pct: float, dd_limit: float | None, cooldown_days: int, target: pd.Series | None = None,
+            prices: dict[str, float] | None = None, tickers: dict[str, str] | None = None,
+            cash_buffer: float = 0.02, min_trade: float = 0.01) -> dict:
+    """Market-hours check: re-create missing trailing stops; enforce the circuit breaker; and, when the
+    account does not match the strategy's target and nothing is pending, place the missing orders (so a
+    failed or skipped daily run heals itself). Reports status."""
     if not env_flag("ENABLE_PAPER_ORDERS") or not env("ALPACA_KEY_ID"):
         print("Paper orders are disabled (ENABLE_PAPER_ORDERS / keys) — nothing to monitor.")
         return {"status": "disabled"}
@@ -122,8 +126,15 @@ def monitor(stop_pct: float, dd_limit: float | None, cooldown_days: int) -> dict
         return result
     if stop_pct > 0:
         result["new_stops"] = len(protect(s, stop_pct))
+    result["orders"] = 0
+    if target is not None and prices is not None:
+        pending = [o for o in _open_orders(s) if o.get("type") != "trailing_stop"]
+        if pending:
+            print(f"{len(pending)} order(s) still pending — not rebalancing until they fill.")
+        else:
+            result["orders"] = len(rebalance(target, prices, cash_buffer, min_trade, dd_limit, cooldown_days, tickers))
     print(f"Market open. Equity ${equity:,.2f}, drawdown {drawdown:+.2%}, positions {len(positions)}, "
-          f"stops added {result['new_stops']}.")
+          f"stops added {result['new_stops']}, orders {result['orders']}.")
     return result
 
 
@@ -146,7 +157,14 @@ def plan_orders(target: pd.Series, equity: float, positions: dict[str, float], p
 
 
 def rebalance(target: pd.Series, prices: dict[str, float], cash_buffer: float, min_trade: float,
-              dd_limit: float | None = None, cooldown_days: int = 20) -> list[dict]:
+              dd_limit: float | None = None, cooldown_days: int = 20,
+              tickers: dict[str, str] | None = None) -> list[dict]:
+    """Bring the paper account to the target weights. Idempotent: the orders are the difference between
+    what the account holds and what the strategy wants, so running it twice places nothing the second time.
+    `tickers` maps canonical symbols to the broker's tickers."""
+    tickers = tickers or {}
+    to_ticker = lambda sym: tickers.get(sym, sym)
+    to_symbol = {v: k for k, v in tickers.items()}
     target = target[target > 1e-9]
     live = env_flag("ENABLE_PAPER_ORDERS")
     if not live:
@@ -158,7 +176,8 @@ def rebalance(target: pd.Series, prices: dict[str, float], cash_buffer: float, m
         if acct.get("trading_blocked") or acct.get("account_blocked"):
             raise BrokerError("Account is blocked")
         equity = float(acct["equity"])
-        positions = {p["symbol"]: float(p["market_value"]) for p in _call(s, "GET", "/v2/positions")}
+        positions = {to_symbol.get(p["symbol"], p["symbol"]): float(p["market_value"])
+                     for p in _call(s, "GET", "/v2/positions")}
         if dd_limit is not None and breaker_active(equity_history(s) + [equity], dd_limit, cooldown_days):
             print(f"Circuit breaker cooldown is active — holding cash instead of the signal.")
             target = target.iloc[0:0]
@@ -169,11 +188,12 @@ def rebalance(target: pd.Series, prices: dict[str, float], cash_buffer: float, m
               f"{'all' if o.get('close_all') else '$' + format(o['notional'], ',.2f')}")
         if not live:
             continue
-        cancel_open_orders(s, o["symbol"])  # a stale trailing stop must not fight the new order
+        tk = to_ticker(o["symbol"])
+        cancel_open_orders(s, tk)  # a stale trailing stop must not fight the new order
         if o.get("close_all"):
-            _call(s, "DELETE", f"/v2/positions/{o['symbol']}")
+            _call(s, "DELETE", f"/v2/positions/{tk}")
         else:
-            body = {"symbol": o["symbol"], "side": o["side"], "type": "market", "time_in_force": "day"}
+            body = {"symbol": tk, "side": o["side"], "type": "market", "time_in_force": "day"}
             if o["side"] == "buy":
                 body["notional"] = str(o["notional"])
             else:

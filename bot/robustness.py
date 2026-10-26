@@ -8,11 +8,14 @@ from __future__ import annotations
 import pandas as pd
 
 from .engine import Result, metrics, simulate
+from .data import MarketData
 from .risk import RiskRules, apply_risk_rules
 from .strategies import TRADING_DAYS_PER_YEAR, dual_momentum, multi_asset_momentum, trend_qqq, trend_qqq_vt
 
 SENSITIVITY = {
     "Trend QQQ, window": (lambda w: lambda c: trend_qqq(c, window=w), [100, 150, 200, 250, 300]),
+    "Trend QQQ, hysteresis band": (lambda b: lambda c: trend_qqq(c, band=b), [0.0, 0.01, 0.02, 0.03, 0.05]),
+    "Trend QQQ, confirmation days": (lambda d: lambda c: trend_qqq(c, confirm_days=d), [1, 2, 3, 5]),
     "Trend QQQ vol-target, target": (lambda v: lambda c: trend_qqq_vt(c, target_vol=v), [0.06, 0.08, 0.10, 0.12, 0.15]),
     "Dual momentum, lookback days": (lambda l: lambda c: dual_momentum(c, lookback=l), [126, 189, 252]),
     "Multi-asset momentum, top N": (lambda n: lambda c: multi_asset_momentum(c, top_n=n), [1, 2, 3]),
@@ -23,16 +26,19 @@ SENSITIVITY = {
 }
 
 
-def parameter_sensitivity(closes: pd.DataFrame, start, capital: float, cost: float) -> tuple[list[str], list[list[str]]]:
-    """CAGR / max drop / Sharpe for each strategy across nearby parameter values."""
+def parameter_sensitivity(md: MarketData | pd.DataFrame, start, capital: float, cost: float) -> tuple[list[str], list[list[str]]]:
+    """CAGR / max drop / Sharpe for each strategy across nearby parameter values (signals only, no risk rules
+    except the stop rows themselves, executed at the next open when open prices are available)."""
     from .report import pct  # local import: report imports this module too
+    closes = md.closes if isinstance(md, MarketData) else md
+    opens = md.opens if isinstance(md, MarketData) else None
     rows = []
     for label, (make, values) in SENSITIVITY.items():
         for v in values:
             fn = make(v)
             targets = fn(closes)
             first = targets.dropna().index[0]
-            res = simulate(closes, targets, max(pd.Timestamp(start), first), capital, cost)
+            res = simulate(closes, targets, max(pd.Timestamp(start), first), capital, cost, opens)
             m = metrics(res)
             rows.append([label, f"{v:.0%}" if isinstance(v, float) else str(v), pct(m["cagr"]),
                          pct(m["max_drawdown"]), f"{m['sharpe']:.2f}", str(m["trades"])])

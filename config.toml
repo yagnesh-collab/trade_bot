@@ -18,7 +18,7 @@ lookback_years = 3
 
 [broker]
 # Which strategy drives Alpaca *paper* orders (only if ENABLE_PAPER_ORDERS=true and keys are set).
-strategy = "trend_qqq"
+strategy = "multi_asset_momentum_vt"
 # Keep some cash so rounding/price moves never cause a rejected order.
 cash_buffer = 0.02
 # Skip rebalancing trades smaller than this fraction of equity.
@@ -30,6 +30,10 @@ trailing_stop_percent = 15.0
 [trend]
 # Moving-average window (trading days) for the trend-following strategies.
 window = 200
+# Anti-whipsaw: enter only when the price is this far above the average (and exit only this far below),
+# and only after this many consecutive closes. 0 and 1 = the plain rule.
+band = 0.02
+confirm_days = 3
 
 [risk]
 # Volatility target for the "_vt" strategies: annualised volatility the position is sized to.
@@ -55,3 +59,21 @@ portfolio_drawdown = 0.20
 cooldown_days = 20
 # Maximum weight of any single asset (1.0 = no cap).
 max_weight = 1.0
+
+[universe]
+# Which ticker to download and trade for each canonical symbol. Defaults are the US ETFs. In the EU,
+# retail brokers only sell UCITS ETFs; put their Yahoo tickers here (check each one on finance.yahoo.com),
+# for example SPY = "SXR8.DE", QQQ = "EQQQ.DE". History is shorter, so set [backtest] start_date accordingly.
+SPY = "SPY"
+QQQ = "QQQ"
+EFA = "EFA"
+EEM = "EEM"
+AGG = "AGG"
+BIL = "BIL"
+GLD = "GLD"
+TLT = "TLT"
+
+[tax]
+# Flat tax on realized gains used for the after-tax estimate in the backtest. German Abgeltungsteuer incl.
+# Solidaritaetszuschlag = 0.26375. Set to 0 to hide the table.
+rate = 0.26375

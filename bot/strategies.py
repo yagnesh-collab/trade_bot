@@ -31,12 +31,28 @@ def buy_hold_spy(closes: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame({"SPY": 1.0}, index=closes.index)
 
 
-def trend_qqq(closes: pd.DataFrame, window: int = 200) -> pd.DataFrame:
-    """Hold Nasdaq-100 (QQQ) while it closes above its 200-day average, else T-bills (BIL)."""
-    sma = closes["QQQ"].rolling(window).mean()
-    choice = pd.Series("BIL", index=closes.index, dtype=object)
-    choice[closes["QQQ"] > sma] = "QQQ"
-    choice[sma.isna()] = None
+def trend_qqq(closes: pd.DataFrame, window: int = 200, band: float = 0.0, confirm_days: int = 1) -> pd.DataFrame:
+    """Hold Nasdaq-100 (QQQ) while it closes above its moving average, else T-bills (BIL).
+
+    Anti-whipsaw rules: `band` adds hysteresis (enter only above average*(1+band), exit only below
+    average*(1-band)) and `confirm_days` requires that many consecutive closes before switching.
+    With band=0 and confirm_days=1 this is the plain rule."""
+    px, sma = closes["QQQ"], closes["QQQ"].rolling(window).mean()
+    above, below = px > sma * (1 + band), px < sma * (1 - band)
+    choice = pd.Series(None, index=closes.index, dtype=object)
+    state, run_above, run_below = None, 0, 0
+    for day in closes.index:
+        if pd.isna(sma[day]):
+            continue
+        run_above = run_above + 1 if above[day] else 0
+        run_below = run_below + 1 if below[day] else 0
+        if state is None:
+            state = "QQQ" if px[day] > sma[day] else "BIL"
+        elif state == "BIL" and run_above >= confirm_days:
+            state = "QQQ"
+        elif state == "QQQ" and run_below >= confirm_days:
+            state = "BIL"
+        choice[day] = state
     return _one_hot(choice, ["QQQ", "BIL"])
 
 
@@ -146,7 +162,8 @@ def multi_asset_momentum(closes: pd.DataFrame, lookback: int = TRADING_DAYS_PER_
 
 
 def volatility_target(weights: pd.DataFrame, closes: pd.DataFrame, target_vol: float = 0.10,
-                      window: int = 20, cash: str = "BIL", max_scale: float = 1.0) -> pd.DataFrame:
+                      window: int = 20, cash: str = "BIL", max_scale: float = 1.0,
+                      rebalance_band: float = 0.10) -> pd.DataFrame:
     """Risk control: scale the risky part of `weights` so recent realized volatility matches `target_vol`.
 
     Uses only returns up to each day's close (the engine still shifts by one day). Exposure is never
@@ -158,15 +175,30 @@ def volatility_target(weights: pd.DataFrame, closes: pd.DataFrame, target_vol: f
     port_ret = (weights.shift(1) * asset_ret).sum(axis=1, min_count=1)
     vol = port_ret.rolling(window).std() * np.sqrt(TRADING_DAYS_PER_YEAR)
     scale = (target_vol / vol.replace(0.0, np.nan)).clip(upper=max_scale).fillna(max_scale)
+    if rebalance_band > 0:  # deadband: only change the size when it moved enough (far fewer small trades)
+        held, out = None, []
+        for v in scale.values:
+            if held is None or abs(v - held) > rebalance_band or v >= max_scale > held:
+                held = float(v)
+            out.append(held)
+        scale = pd.Series(out, index=scale.index)
     scaled = weights[risky].mul(scale, axis=0)
     scaled[cash] = 1.0 - scaled[risky].sum(axis=1)
     scaled[weights[risky].isna().any(axis=1) | vol.isna()] = float("nan")
     return scaled[list(weights.columns) if cash in weights.columns else risky + [cash]]
 
 
-def trend_qqq_vt(closes: pd.DataFrame, window: int = 200, target_vol: float = 0.10, vol_window: int = 20) -> pd.DataFrame:
+def trend_qqq_vt(closes: pd.DataFrame, window: int = 200, target_vol: float = 0.10, vol_window: int = 20,
+                 band: float = 0.0, confirm_days: int = 1) -> pd.DataFrame:
     """Trend-following Nasdaq-100 with volatility targeting (same signal, risk-controlled size)."""
-    return volatility_target(trend_qqq(closes, window), closes, target_vol, vol_window)
+    return volatility_target(trend_qqq(closes, window, band, confirm_days), closes, target_vol, vol_window)
+
+
+def multi_asset_momentum_vt(closes: pd.DataFrame, lookback: int = TRADING_DAYS_PER_YEAR, top_n: int = 2,
+                            target_vol: float = 0.10, vol_window: int = 20) -> pd.DataFrame:
+    """Multi-asset momentum with volatility targeting: diversified AND risk-sized. The lowest-drawdown
+    active strategy in the backtest, which is why it is the default for paper orders."""
+    return volatility_target(multi_asset_momentum(closes, lookback, top_n), closes, target_vol, vol_window)
 
 
 @dataclass(frozen=True)
@@ -177,21 +209,31 @@ class Strategy:
     fn: Callable[[pd.DataFrame], pd.DataFrame]
 
 
-# Passive allocations are never wrapped with stop-loss rules: their whole point is to hold through everything.
+# Passive allocations never get stop-loss rules: their whole point is to hold through everything.
 PASSIVE = {"buy_hold_spy", "buffett_90_10", "sixty_forty"}
 
+# Risk rules for the active strategies, set from config.toml by `configure`; None = off.
+RULES: RiskRules | None = None
 
-def with_risk_rules(fn: Callable[[pd.DataFrame], pd.DataFrame], rules: RiskRules) -> Callable[[pd.DataFrame], pd.DataFrame]:
-    return lambda closes: apply_risk_rules(fn(closes), closes, rules)
+
+def targets_for(key: str, closes: pd.DataFrame, highs: pd.DataFrame | None = None,
+                lows: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Strategy signal plus the risk rules (when configured and the strategy is active)."""
+    t = STRATEGIES[key].fn(closes)
+    if RULES is not None and key not in PASSIVE:
+        t = apply_risk_rules(t, closes, RULES, highs, lows)
+    return t
 
 
 def build_strategies(trend_window: int = 200, target_vol: float = 0.10, vol_window: int = 20,
                      momentum_lookback: int = TRADING_DAYS_PER_YEAR, top_n: int = 2,
-                     rules: RiskRules | None = None) -> dict[str, Strategy]:
-    """The strategy table. Parameters come from config.toml via `configure`; defaults are the classic values.
-    When `rules` is given, every active (non-passive) strategy gets the stop-loss / circuit-breaker overlay."""
-    table = {
+                     band: float = 0.0, confirm_days: int = 1) -> dict[str, Strategy]:
+    """The strategy table. Parameters come from config.toml via `configure`; defaults are the classic values."""
+    anti = f" (band {band:.0%}, {confirm_days}-day confirmation)" if band or confirm_days > 1 else ""
+    return {
         s.key: s for s in [
+            Strategy("buy_hold_spy", "Buy & hold S&P 500 (benchmark)",
+                     "Always 100 % SPY. Every strategy must beat this to be worth using.", buy_hold_spy),
             Strategy("buffett_90_10", "Buffett 90/10 (passive)",
                      "90 % SPY, 10 % T-bills, never trades. Buffett's own advice for private investors.", buffett_90_10),
             Strategy("sixty_forty", "60/40 stocks/bonds (passive)",
@@ -201,49 +243,44 @@ def build_strategies(trend_window: int = 200, target_vol: float = 0.10, vol_wind
             Strategy("mean_reversion_rsi2", "Mean reversion RSI(2) S&P 500",
                      "Buy SPY on a sharp dip in an uptrend (RSI(2) below 10), sell above the 5-day average.",
                      mean_reversion_rsi2),
-            Strategy("buy_hold_spy", "Buy & hold S&P 500 (benchmark)",
-                     "Always 100 % SPY. Every strategy must beat this to be worth using.", buy_hold_spy),
             Strategy("trend_qqq", "Trend-following Nasdaq-100",
-                     f"QQQ while above its {trend_window}-day average, otherwise T-bills (BIL).",
-                     partial(trend_qqq, window=trend_window)),
+                     f"QQQ while above its {trend_window}-day average, otherwise T-bills (BIL){anti}.",
+                     partial(trend_qqq, window=trend_window, band=band, confirm_days=confirm_days)),
             Strategy("trend_qqq_vt", f"Trend Nasdaq-100, {target_vol:.0%} vol target",
                      "Same signal, but position size shrinks when recent volatility is high.",
-                     partial(trend_qqq_vt, window=trend_window, target_vol=target_vol, vol_window=vol_window)),
+                     partial(trend_qqq_vt, window=trend_window, target_vol=target_vol, vol_window=vol_window,
+                             band=band, confirm_days=confirm_days)),
             Strategy("dual_momentum", "Dual momentum (monthly)",
                      "Best of SPY/EFA by 12-month return if stocks beat T-bills, else bonds (AGG).",
                      partial(dual_momentum, lookback=momentum_lookback)),
             Strategy("multi_asset_momentum", f"Multi-asset momentum (top {top_n} of 6)",
                      "Monthly: best assets among SPY, QQQ, EFA, EEM, GLD, TLT that beat T-bills; rest in BIL.",
                      partial(multi_asset_momentum, lookback=momentum_lookback, top_n=top_n)),
+            Strategy("multi_asset_momentum_vt", f"Multi-asset momentum, {target_vol:.0%} vol target",
+                     "Diversified and risk-sized: the multi-asset strategy with volatility targeting.",
+                     partial(multi_asset_momentum_vt, lookback=momentum_lookback, top_n=top_n,
+                             target_vol=target_vol, vol_window=vol_window)),
         ]
     }
-    table = {"buy_hold_spy": Strategy("buy_hold_spy", "Buy & hold S&P 500 (benchmark)",
-                                      "Always 100 % SPY. Every strategy must beat this to be worth using.", buy_hold_spy),
-             **table}
-    if rules is not None:
-        for key, st in list(table.items()):
-            if key not in PASSIVE:
-                table[key] = Strategy(st.key, st.name + " + risk rules", st.description, with_risk_rules(st.fn, rules))
-    return table
 
 
 STRATEGIES: dict[str, Strategy] = build_strategies()
 
 
 def configure(cfg: dict) -> None:
-    """Rebuild STRATEGIES in place from config.toml sections [trend], [risk] and [momentum]."""
+    """Rebuild STRATEGIES and RULES in place from config.toml."""
+    global RULES
     t, r, m, st = cfg.get("trend", {}), cfg.get("risk", {}), cfg.get("momentum", {}), cfg.get("stops", {})
-    rules = None
+    RULES = None
     if st.get("enabled", False):
-        rules = RiskRules(stop_loss=st.get("stop_loss") or None, portfolio_drawdown=st.get("portfolio_drawdown") or None,
+        RULES = RiskRules(stop_loss=st.get("stop_loss") or None, portfolio_drawdown=st.get("portfolio_drawdown") or None,
                           cooldown_days=int(st.get("cooldown_days", 20)), max_weight=float(st.get("max_weight", 1.0)),
                           cost=float(cfg.get("costs", {}).get("per_turnover", 0.0005)))
     STRATEGIES.clear()
     STRATEGIES.update(build_strategies(
-        trend_window=int(t.get("window", 200)),
+        trend_window=int(t.get("window", 200)), band=float(t.get("band", 0.0)), confirm_days=int(t.get("confirm_days", 1)),
         target_vol=float(r.get("target_vol", 0.10)), vol_window=int(r.get("vol_window", 20)),
         momentum_lookback=int(m.get("lookback_days", TRADING_DAYS_PER_YEAR)), top_n=int(m.get("top_n", 2)),
-        rules=rules,
     ))
 
 

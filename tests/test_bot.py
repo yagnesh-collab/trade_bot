@@ -4,13 +4,15 @@ import pandas as pd
 import pytest
 
 from bot import broker
-from bot.engine import hindsight_best_trade, max_drawdown, metrics, monthly_returns, simulate
+from bot.data import DataError, validate
+from bot.engine import after_tax, hindsight_best_trade, max_drawdown, metrics, monthly_returns, simulate
 from bot.report import backtest_report, daily_report, monthly_report
 from bot.risk import RiskRules, apply_risk_rules
 from bot.robustness import parameter_sensitivity, rolling_win_rate, trailing
-from bot.strategies import (MOMENTUM_UNIVERSE, STRATEGIES, SYMBOLS, buffett_90_10, build_strategies, configure,
+import bot.strategies as strategies
+from bot.strategies import (MOMENTUM_UNIVERSE, STRATEGIES, SYMBOLS, buffett_90_10, build_strategies, buy_hold_spy, configure,
                             dual_momentum, golden_cross_spy, mean_reversion_rsi2, month_end_mask, multi_asset_momentum,
-                            rsi, sixty_forty, trend_qqq, volatility_target)
+                            multi_asset_momentum_vt, rsi, sixty_forty, targets_for, trend_qqq, volatility_target)
 
 
 def synthetic(days=900, seed=0):
@@ -163,7 +165,7 @@ def test_robustness_tables():
     c = synthetic(days=1100, seed=2)
     start = c.index[320]
     header, rows = parameter_sensitivity(c, start, 10_000, 0.0005)
-    assert len(rows) == 5 + 5 + 3 + 3 + 5 + 4 and len(header) == 6
+    assert len(rows) == 5 + 5 + 4 + 5 + 3 + 3 + 5 + 4 and len(header) == 6
     res = {k: simulate(c, s.fn(c), start, 10_000, 0.0005) for k, s in STRATEGIES.items()}
     header, rows = rolling_win_rate(res, years=1)
     assert len(rows) == len(STRATEGIES) - 1 and all(r[2].endswith("%") for r in rows)
@@ -196,17 +198,18 @@ def test_circuit_breaker_goes_to_cash_on_portfolio_drawdown():
     assert w["SPY"].iloc[-1] == 1.0                              # resumed afterwards
 
 
-def test_risk_rules_keep_passive_strategies_untouched():
+def test_risk_rules_apply_only_to_active_strategies():
     configure({"stops": {"enabled": True, "stop_loss": 0.15, "portfolio_drawdown": 0.2}})
     try:
-        assert "risk rules" not in STRATEGIES["buy_hold_spy"].name
-        assert "risk rules" not in STRATEGIES["buffett_90_10"].name
-        assert STRATEGIES["trend_qqq"].name.endswith("+ risk rules")
+        assert strategies.RULES is not None
         c = synthetic(days=500, seed=5)
-        w = STRATEGIES["trend_qqq"].fn(c).dropna()
-        assert ((w.sum(axis=1) - 1).abs() < 1e-9).all()
+        pd.testing.assert_frame_equal(targets_for("buy_hold_spy", c), buy_hold_spy(c))      # passive: untouched
+        pd.testing.assert_frame_equal(targets_for("buffett_90_10", c), buffett_90_10(c))
+        w = targets_for("trend_qqq", c).dropna()
+        assert ((w.sum(axis=1) - 1).abs() < 1e-9).all() and "BIL" in w.columns              # active: rules applied
     finally:
-        STRATEGIES.clear(); STRATEGIES.update(build_strategies())
+        configure({})
+        assert strategies.RULES is None
 
 
 def test_classic_strategies():
@@ -239,3 +242,65 @@ def test_breaker_active_from_equity_history():
 def test_monitor_is_a_no_op_without_paper_orders(monkeypatch):
     monkeypatch.delenv("ENABLE_PAPER_ORDERS", raising=False)
     assert broker.monitor(15.0, 0.2, 20) == {"status": "disabled"}
+
+
+def test_trend_hysteresis_delays_and_filters_switches():
+    idx = pd.bdate_range("2020-01-01", periods=320)
+    px = np.full(320, 100.0)
+    px[300:] = 100.5                               # 0.5 % above a flat 200-day average
+    c = pd.DataFrame({"QQQ": px, "BIL": 100.0}, index=idx)
+    assert trend_qqq(c).dropna()["QQQ"].iloc[-1] == 1.0                           # plain rule enters
+    assert trend_qqq(c, band=0.02, confirm_days=3).dropna()["QQQ"].iloc[-1] == 0.0  # band blocks it
+    spike = px.copy(); spike[305] = 103.0           # one day above the band
+    c2 = pd.DataFrame({"QQQ": spike, "BIL": 100.0}, index=idx)
+    assert trend_qqq(c2, band=0.02, confirm_days=3).dropna()["QQQ"].sum() == 0    # no entry on one day
+    run = px.copy(); run[305:308] = 103.0            # three consecutive days above the band
+    c3 = pd.DataFrame({"QQQ": run, "BIL": 100.0}, index=idx)
+    w = trend_qqq(c3, band=0.02, confirm_days=3).dropna()
+    assert w["QQQ"].loc[idx[306]] == 0.0 and w["QQQ"].loc[idx[307]] == 1.0        # enters on the third day
+
+
+def test_validate_rejects_bad_or_stale_data():
+    c = synthetic(days=300)
+    validate(c, today=c.index[-1])
+    bad = c.copy(); bad.iloc[100, 0] *= 2
+    with pytest.raises(DataError, match="implausible"):
+        validate(bad, today=c.index[-1])
+    with pytest.raises(DataError, match="stale"):
+        validate(c, today=c.index[-1] + pd.Timedelta(days=20))
+    neg = c.copy(); neg.iloc[5, 1] = 0.0
+    with pytest.raises(DataError, match="non-positive"):
+        validate(neg, today=c.index[-1])
+
+
+def test_next_open_execution_buys_one_day_later():
+    """A decision at close k is filled at the next open; with open == close that is close k+1."""
+    c = synthetic(days=400, seed=6)
+    k = 300
+    close_fill = simulate(c, buy_hold_spy(c), c.index[k], 10_000, 0.0)
+    open_fill = simulate(c, buy_hold_spy(c), c.index[k], 10_000, 0.0, opens=c)
+    assert close_fill.equity.iloc[-1] == pytest.approx(10_000 * c["SPY"].iloc[-1] / c["SPY"].iloc[k])
+    assert open_fill.equity.iloc[-1] == pytest.approx(10_000 * c["SPY"].iloc[-1] / c["SPY"].iloc[k + 1])
+    t = trend_qqq(c)
+    assert simulate(c, t, c.index[k], 10_000, 0.0005, opens=c).switches.sum() == simulate(c, t, c.index[k], 10_000, 0.0005).switches.sum()
+
+
+def test_after_tax_estimate():
+    c = synthetic(days=900, seed=7)
+    res = simulate(c, trend_qqq(c), c.index[300], 10_000, 0.0005)
+    t = after_tax(res, 0.26375)
+    assert t["tax_paid"] >= 0 and t["after_tax_value"] <= res.equity.iloc[-1] + 1e-9
+    passive = simulate(c, buy_hold_spy(c), c.index[300], 10_000, 0.0)
+    assert after_tax(passive, 0.26375)["tax_paid"] == 0.0        # nothing realized -> no tax
+
+
+def test_vol_target_deadband_reduces_size_changes():
+    c = synthetic(days=600, seed=8)
+    raw = trend_qqq(c)
+    jumpy = volatility_target(raw, c, target_vol=0.05, window=20, rebalance_band=0.0).dropna()
+    calm = volatility_target(raw, c, target_vol=0.05, window=20, rebalance_band=0.10).dropna()
+    changes = lambda w: int((w["QQQ"].diff().abs() > 1e-12).sum())
+    assert changes(calm) < changes(jumpy)
+    assert ((calm.sum(axis=1) - 1).abs() < 1e-9).all()
+    m = multi_asset_momentum_vt(c).dropna()
+    assert ((m.sum(axis=1) - 1).abs() < 1e-9).all() and (m[MOMENTUM_UNIVERSE] <= 0.5 + 1e-9).all().all()
