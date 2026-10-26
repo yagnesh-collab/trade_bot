@@ -23,3 +23,32 @@ strategy = "trend_qqq"
 cash_buffer = 0.02
 # Skip rebalancing trades smaller than this fraction of equity.
 min_trade_fraction = 0.01
+
+[trend]
+# Moving-average window (trading days) for the trend-following strategies.
+window = 200
+
+[risk]
+# Volatility target for the "_vt" strategies: annualised volatility the position is sized to.
+# 0.10 = 10 %. Exposure is only ever reduced (max 100 %), never leveraged.
+target_vol = 0.10
+# Trading days used to measure recent volatility.
+vol_window = 20
+
+[momentum]
+# Lookback for the momentum strategies (252 trading days = 12 months) and how many assets the
+# multi-asset strategy holds at once.
+lookback_days = 252
+top_n = 2
+
+[stops]
+# Risk rules applied on top of every active strategy (not to the passive buy-and-hold allocations).
+enabled = true
+# Trailing stop-loss per holding: exit when it falls this far below its highest close since entry.
+stop_loss = 0.15
+# Circuit breaker: go to cash when the whole portfolio is this far below its peak.
+portfolio_drawdown = 0.20
+# Trading days to stay out after a stop or a breaker before following the signal again.
+cooldown_days = 20
+# Maximum weight of any single asset (1.0 = no cap).
+max_weight = 1.0

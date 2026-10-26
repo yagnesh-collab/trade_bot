@@ -85,7 +85,8 @@ def daily_report(results: dict[str, Result], capital: float) -> Report:
 
 
 def monthly_report(results: dict[str, Result], capital: float, month: pd.Period,
-                   spy: pd.Series, backtest: dict[str, dict] | None) -> Report:
+                   spy: pd.Series, backtest: dict[str, dict] | None,
+                   trailing: tuple[list[str], list[list[str]]] | None = None) -> Report:
     rep = Report(f"Monthly trading report — {month.strftime('%B %Y')}")
     rows = []
     for key, res in results.items():
@@ -107,6 +108,11 @@ def monthly_report(results: dict[str, Result], capital: float, month: pd.Period,
                  f"(buy {buy:%d %b}, sell {sell:%d %b}) — only knowable after the fact."
                  if buy is not None else "Hindsight check: SPY only fell this month; the best trade was no trade.")
 
+    if trailing:
+        rep.table("Last 12 months vs the benchmark", *trailing)
+        rep.note("Decision rule (pre-committed): real money moves only after at least 6 months of paper results, "
+                 "and only into a strategy that beat the benchmark on BOTH return and max drop over the last 12 months. "
+                 "If none does, buy and hold the benchmark.")
     if backtest:
         rep.table("Long-run backtest for context", *backtest_rows(backtest))
     return rep
@@ -120,7 +126,8 @@ def backtest_rows(stats: dict[str, dict]) -> tuple[list[str], list[list[str]]]:
     return header, rows
 
 
-def backtest_report(results: dict[str, Result]) -> Report:
+def backtest_report(results: dict[str, Result],
+                    extra_tables: list[tuple[str, list[str], list[list[str]]]] | None = None) -> Report:
     any_res = next(iter(results.values()))
     start, end = any_res.equity.index[0], any_res.equity.index[-1]
     rep = Report(f"Backtest {start:%b %Y} – {end:%b %Y}")
@@ -134,4 +141,6 @@ def backtest_report(results: dict[str, Result]) -> Report:
     yr = yearly / yearly.shift(1).fillna(first) - 1
     rep.table("Calendar-year returns", ["Year"] + [STRATEGIES[k].name for k in yr.columns],
               [[str(y)] + [pct(v) for v in row] for y, row in yr.iterrows()])
+    for caption, header, rows in extra_tables or []:
+        rep.table(caption, header, rows)
     return rep

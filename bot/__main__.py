@@ -11,7 +11,8 @@ from .config import ROOT, load_config
 from .data import fetch_closes
 from .engine import Result, metrics, simulate
 from .report import Report, backtest_report, daily_report, monthly_report
-from .strategies import STRATEGIES, SYMBOLS
+from .robustness import parameter_sensitivity, rolling_win_rate, trailing
+from .strategies import STRATEGIES, SYMBOLS, configure
 
 OUT = ROOT / "out"
 
@@ -50,13 +51,18 @@ def main() -> None:
     args = p.parse_args()
 
     cfg = load_config()
+    configure(cfg)
     capital, cost = cfg["paper"]["initial_capital"], cfg["costs"]["per_turnover"]
     email = not args.no_email
 
     if args.command == "backtest":
         closes = fetch_closes(SYMBOLS, cfg["backtest"]["start_date"])
-        results = run_all(closes, common_start(closes, cfg["backtest"]["start_date"]), capital, cost)
-        publish(backtest_report(results), "backtest", email)
+        start = common_start(closes, cfg["backtest"]["start_date"])
+        results = run_all(closes, start, capital, cost)
+        extra = [("Robustness: nearby parameters (an edge that vanishes here was noise)",
+                  *parameter_sensitivity(closes, start, capital, cost)),
+                 ("Robustness: rolling 3-year windows vs the benchmark", *rolling_win_rate(results))]
+        publish(backtest_report(results, extra), "backtest", email)
         return
 
     paper_start = pd.Timestamp(cfg["paper"]["start_date"])
@@ -85,7 +91,8 @@ def main() -> None:
             return
         bt_closes = fetch_closes(SYMBOLS, cfg["backtest"]["start_date"])
         bt = run_all(bt_closes, common_start(bt_closes, cfg["backtest"]["start_date"]), capital, cost)
-        publish(monthly_report(results, capital, month, closes["SPY"], {k: metrics(r) for k, r in bt.items()}),
+        publish(monthly_report(results, capital, month, closes["SPY"], {k: metrics(r) for k, r in bt.items()},
+                               trailing(results)),
                 f"monthly-{month}", email)
 
 

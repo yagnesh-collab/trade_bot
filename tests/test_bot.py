@@ -6,7 +6,11 @@ import pytest
 from bot import broker
 from bot.engine import hindsight_best_trade, max_drawdown, metrics, monthly_returns, simulate
 from bot.report import backtest_report, daily_report, monthly_report
-from bot.strategies import STRATEGIES, SYMBOLS, dual_momentum, month_end_mask, trend_qqq
+from bot.risk import RiskRules, apply_risk_rules
+from bot.robustness import parameter_sensitivity, rolling_win_rate, trailing
+from bot.strategies import (MOMENTUM_UNIVERSE, STRATEGIES, SYMBOLS, buffett_90_10, build_strategies, configure,
+                            dual_momentum, golden_cross_spy, mean_reversion_rsi2, month_end_mask, multi_asset_momentum,
+                            rsi, sixty_forty, trend_qqq, volatility_target)
 
 
 def synthetic(days=900, seed=0):
@@ -114,3 +118,104 @@ def test_broker_refuses_live_keys(monkeypatch):
     with pytest.raises(broker.BrokerError, match="PAPER"):
         broker._session()
     assert broker.PAPER_URL == "https://paper-api.alpaca.markets"
+
+
+def test_volatility_target_only_reduces_exposure():
+    c = synthetic(days=400, seed=3)
+    raw = trend_qqq(c)
+    vt = volatility_target(raw, c, target_vol=0.02, window=20)  # very low target -> must scale down
+    ok = vt.dropna()
+    assert ((ok.sum(axis=1) - 1).abs() < 1e-9).all()               # fully allocated: risky + cash = 100 %
+    assert (ok["QQQ"] <= raw.loc[ok.index, "QQQ"] + 1e-12).all()  # never above the raw signal
+    assert (ok["QQQ"] < raw.loc[ok.index, "QQQ"]).any()           # and actually reduced somewhere
+    calm = volatility_target(raw, c, target_vol=5.0, window=20).dropna()
+    pd.testing.assert_frame_equal(calm, raw.loc[calm.index], check_dtype=False)  # high target -> unchanged
+
+
+def test_multi_asset_momentum_picks_winners_and_goes_to_cash():
+    c = synthetic(days=600, seed=1)
+    n = len(c)
+    c["GLD"] = np.linspace(100, 400, n)     # strongest
+    c["TLT"] = np.linspace(100, 300, n)     # second
+    for s in ["SPY", "QQQ", "EFA", "EEM"]:
+        c[s] = np.linspace(100, 90, n)      # losers
+    c["BIL"] = np.linspace(100, 102, n)
+    w = multi_asset_momentum(c, top_n=2).dropna()
+    assert (w[["GLD", "TLT"]] == 0.5).all().all() and (w[["SPY", "QQQ", "EFA", "EEM", "BIL"]] == 0).all().all()
+    changes = w.ne(w.shift()).any(axis=1).iloc[1:]
+    assert changes[changes].index.isin(w.index[month_end_mask(w.index)]).all()
+    for s in MOMENTUM_UNIVERSE:
+        c[s] = np.linspace(100, 90, n)      # everything loses to T-bills
+    assert (multi_asset_momentum(c, top_n=2).dropna()["BIL"] == 1).all()
+
+
+def test_configure_rebuilds_strategy_table():
+    configure({"trend": {"window": 150}, "risk": {"target_vol": 0.08}, "momentum": {"top_n": 3}})
+    try:
+        assert "150-day" in STRATEGIES["trend_qqq"].description
+        assert "8%" in STRATEGIES["trend_qqq_vt"].name
+        assert "top 3" in STRATEGIES["multi_asset_momentum"].name
+    finally:
+        STRATEGIES.clear(); STRATEGIES.update(build_strategies())
+
+
+def test_robustness_tables():
+    c = synthetic(days=1100, seed=2)
+    start = c.index[320]
+    header, rows = parameter_sensitivity(c, start, 10_000, 0.0005)
+    assert len(rows) == 5 + 5 + 3 + 3 + 5 + 4 and len(header) == 6
+    res = {k: simulate(c, s.fn(c), start, 10_000, 0.0005) for k, s in STRATEGIES.items()}
+    header, rows = rolling_win_rate(res, years=1)
+    assert len(rows) == len(STRATEGIES) - 1 and all(r[2].endswith("%") for r in rows)
+    header, rows = trailing(res)
+    assert rows[0][-1] == "benchmark" and all(r[-1] in {"yes", "no", "benchmark"} for r in rows)
+
+
+def test_trailing_stop_exits_and_reenters_after_cooldown():
+    idx = pd.bdate_range("2024-01-01", periods=80)
+    px = np.full(80, 100.0)
+    px[30:] = 80.0   # a 20 % drop on day 30
+    c = pd.DataFrame({"QQQ": px, "BIL": 100.0}, index=idx)
+    raw = pd.DataFrame({"QQQ": 1.0, "BIL": 0.0}, index=idx)
+    w = apply_risk_rules(raw, c, RiskRules(stop_loss=0.15, portfolio_drawdown=None, cooldown_days=10))
+    assert w["QQQ"].iloc[29] == 1.0
+    assert (w["QQQ"].iloc[30:40] == 0).all() and (w["BIL"].iloc[30:40] == 1).all()  # stopped out, in cash
+    assert w["QQQ"].iloc[40] == 1.0                                              # back in after the cooldown
+    assert ((w.sum(axis=1) - 1).abs() < 1e-9).all()
+
+
+def test_circuit_breaker_goes_to_cash_on_portfolio_drawdown():
+    idx = pd.bdate_range("2024-01-01", periods=60)
+    px = 100 * np.cumprod(np.r_[np.ones(20), np.full(10, 0.97), np.ones(30)])  # -26 % over 10 days
+    c = pd.DataFrame({"SPY": px, "BIL": 100.0}, index=idx)
+    raw = pd.DataFrame({"SPY": 1.0, "BIL": 0.0}, index=idx)
+    w = apply_risk_rules(raw, c, RiskRules(stop_loss=None, portfolio_drawdown=0.20, cooldown_days=15))
+    first_out = w.index[(w["SPY"] == 0)][0]
+    assert 20 < idx.get_loc(first_out) < 30                      # tripped during the slide
+    assert (w["SPY"].iloc[idx.get_loc(first_out):idx.get_loc(first_out) + 15] == 0).all()
+    assert w["SPY"].iloc[-1] == 1.0                              # resumed afterwards
+
+
+def test_risk_rules_keep_passive_strategies_untouched():
+    configure({"stops": {"enabled": True, "stop_loss": 0.15, "portfolio_drawdown": 0.2}})
+    try:
+        assert "risk rules" not in STRATEGIES["buy_hold_spy"].name
+        assert "risk rules" not in STRATEGIES["buffett_90_10"].name
+        assert STRATEGIES["trend_qqq"].name.endswith("+ risk rules")
+        c = synthetic(days=500, seed=5)
+        w = STRATEGIES["trend_qqq"].fn(c).dropna()
+        assert ((w.sum(axis=1) - 1).abs() < 1e-9).all()
+    finally:
+        STRATEGIES.clear(); STRATEGIES.update(build_strategies())
+
+
+def test_classic_strategies():
+    c = synthetic(days=600, seed=4)
+    assert (buffett_90_10(c)[["SPY", "BIL"]].sum(axis=1) == 1).all() and (sixty_forty(c)["AGG"] == 0.4).all()
+    g = golden_cross_spy(c).dropna()
+    assert set(np.unique(g.values)) <= {0.0, 1.0} and (g.sum(axis=1) == 1).all()
+    r = rsi(pd.Series(np.linspace(1, 2, 50)), 2)
+    assert (r.iloc[5:] > 99).all()                                 # a pure uptrend saturates RSI near 100
+    m = mean_reversion_rsi2(c).dropna()
+    assert (m.sum(axis=1) == 1).all() and (m["SPY"] == 1).any() and (m["BIL"] == 1).any()
+
