@@ -23,6 +23,9 @@ strategy = "trend_qqq"
 cash_buffer = 0.02
 # Skip rebalancing trades smaller than this fraction of equity.
 min_trade_fraction = 0.01
+# Trailing stop placed AT THE BROKER for every paper position (percent below the high since entry).
+# Alpaca executes it itself, so it protects you even when no workflow is running. 0 = off.
+trailing_stop_percent = 15.0
 
 [trend]
 # Moving-average window (trading days) for the trend-following strategies.

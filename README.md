@@ -51,6 +51,7 @@ The simulation includes trading costs and a one-day signal delay: a decision mad
 
 ## What you receive
 
+- **Circuit-breaker alert**: an email if the monitor had to close all positions.
 - **Daily email** (around 23:15 Berlin time, Mon–Fri): each strategy's holding, any BUY/SELL switch, today's change, value, return since start, and largest drop so far.
 - **Monthly email** (on the 1st): last month's return per strategy, ranked against the benchmark; the number of up months so far; the best possible SPY trade that month in hindsight, for comparison; and the 20-year backtest for context.
 - **Backtest** (run it whenever you like): 20 years of results with calendar-year returns, plus two robustness tables: the same strategies with nearby parameters (if the result changes a lot when the moving-average window moves from 200 to 250 days, the edge was noise), and how often each strategy beat the benchmark over every rolling 3-year window.
@@ -106,6 +107,31 @@ Safety built in:
 - It refuses any key that isn't a paper key.
 - Without `ENABLE_PAPER_ORDERS=true` it only prints what it would do.
 - Orders are submitted after the close, so they fill at the next market open.
+
+### Protection during market hours (no six-hour job needed)
+
+The strategies decide on daily closes, so nothing is gained by running them all day. What does matter
+during the session is protection, and that is handled in two layers that do not depend on a long-running job:
+
+1. **Stops live at the broker.** Every paper position gets a good-till-cancelled trailing-stop order
+   (`trailing_stop_percent` in `config.toml`, default 15 %). Alpaca executes it itself, every second the
+   market is open, whether or not any workflow is running. Whole shares only: Alpaca does not accept
+   fractional stop orders.
+2. **A light monitor every 30 minutes** (`.github/workflows/monitor.yml`, Mon-Fri during US hours) runs
+   `python -m bot monitor`: it re-creates missing stops (for example after the daily run bought something),
+   checks the portfolio circuit breaker against the account's own equity history, closes everything and
+   emails you if it trips, and exits in seconds when the market is closed. The daily run also respects the
+   breaker cooldown and cancels stale stops before it trades.
+
+Why not one job for the whole session: GitHub stops a job after 6 hours, and a chain of jobs that hands
+state to the next one needs a personal access token and costs about 140 hours of Actions minutes a month,
+far more than the free 2,000 minutes of a private repository. Thirty short runs a day cost about 350 minutes
+a month, and because every run is stateless (it reads positions and orders from Alpaca), a missed or late run
+is harmless; the next one does the same check. GitHub's scheduler can be minutes late and occasionally skips
+a slot, which is another reason the stops themselves sit at the broker.
+
+Keep the schedule alive: GitHub disables scheduled workflows after 60 days without a commit; the monthly
+Dependabot and Renovate updates count, so merging them keeps the bot running.
 
 **Live trading is intentionally not implemented.** Consider it only after at least 3–6 months of paper results that beat the benchmark. Even then, start with money you can afford to lose and an account with withdrawals disabled for the API.
 

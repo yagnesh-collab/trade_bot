@@ -44,7 +44,7 @@ def publish(rep: Report, name: str, email: bool) -> None:
 
 def main() -> None:
     p = argparse.ArgumentParser(prog="bot")
-    p.add_argument("command", choices=["daily", "monthly", "backtest"])
+    p.add_argument("command", choices=["daily", "monthly", "backtest", "monitor"])
     p.add_argument("--no-email", action="store_true")
     p.add_argument("--force", action="store_true", help="daily: report even if there is no new close")
     p.add_argument("--month", help="YYYY-MM for the monthly report (default: last complete month)")
@@ -54,6 +54,18 @@ def main() -> None:
     configure(cfg)
     capital, cost = cfg["paper"]["initial_capital"], cfg["costs"]["per_turnover"]
     email = not args.no_email
+    stops = cfg.get("stops", {})
+    dd_limit = stops.get("portfolio_drawdown") if stops.get("enabled") else None
+    cooldown = int(stops.get("cooldown_days", 20))
+
+    if args.command == "monitor":
+        res = broker.monitor(float(cfg["broker"].get("trailing_stop_percent", 0.0)), dd_limit, cooldown)
+        if res.get("breaker") and email:
+            from .notify import send_email
+            text = (f"The portfolio circuit breaker closed all paper positions: equity ${res['equity']:,.2f}, "
+                    f"{res['drawdown']:+.2%} from its peak. Cooldown: {cooldown} trading days.")
+            send_email("Trading bot: circuit breaker triggered", text, f"<p>{text}</p>")
+        return
 
     if args.command == "backtest":
         closes = fetch_closes(SYMBOLS, cfg["backtest"]["start_date"])
@@ -82,7 +94,7 @@ def main() -> None:
         b = cfg["broker"]
         key = b["strategy"]
         broker.rebalance(results[key].targets.iloc[-1], closes.iloc[-1].to_dict(),
-                         b["cash_buffer"], b["min_trade_fraction"])
+                         b["cash_buffer"], b["min_trade_fraction"], dd_limit, cooldown)
     else:
         month = (pd.Period(args.month, "M") if args.month
                  else pd.Timestamp.now(tz="America/New_York").tz_localize(None).to_period("M") - 1)

@@ -219,3 +219,23 @@ def test_classic_strategies():
     m = mean_reversion_rsi2(c).dropna()
     assert (m.sum(axis=1) == 1).all() and (m["SPY"] == 1).any() and (m["BIL"] == 1).any()
 
+
+def test_needs_protection_only_for_uncovered_whole_shares():
+    positions = [{"symbol": "QQQ", "qty": "12.4"}, {"symbol": "GLD", "qty": "0.7"}, {"symbol": "TLT", "qty": "5"}]
+    orders = [{"symbol": "TLT", "type": "trailing_stop", "side": "sell"}, {"symbol": "QQQ", "type": "market", "side": "buy"}]
+    assert broker.needs_protection(positions, orders) == [{"symbol": "QQQ", "qty": 12}]
+
+
+def test_breaker_active_from_equity_history():
+    calm = [100, 101, 99, 102, 103]
+    assert not broker.breaker_active(calm, 0.20, 20)
+    crash = [100, 105, 90, 80, 82]                      # -24 % from the 105 peak, 1 day ago
+    assert broker.breaker_active(crash, 0.20, 20)
+    old_crash = crash + [83] * 25                        # tripped 26 points ago, cooldown 20 -> over
+    assert not broker.breaker_active(old_crash, 0.20, 20)
+    assert broker.breaker_active(old_crash, 0.20, 30)
+
+
+def test_monitor_is_a_no_op_without_paper_orders(monkeypatch):
+    monkeypatch.delenv("ENABLE_PAPER_ORDERS", raising=False)
+    assert broker.monitor(15.0, 0.2, 20) == {"status": "disabled"}
