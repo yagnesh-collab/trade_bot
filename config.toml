@@ -1,0 +1,25 @@
+# Trading bot configuration. Contains NO secrets — secrets live in GitHub Actions secrets / a local .env.
+
+[paper]
+# Paper portfolios start on this date with this much (fake) money, in USD.
+start_date = "2026-10-26"
+initial_capital = 10000.0
+
+[costs]
+# Cost charged per unit of turnover (spread + slippage). 0.0005 = 0.05 %.
+per_turnover = 0.0005
+
+[backtest]
+start_date = "2005-01-01"
+
+[data]
+# How much history to download (the 200-day and 12-month signals need warm-up data).
+lookback_years = 3
+
+[broker]
+# Which strategy drives Alpaca *paper* orders (only if ENABLE_PAPER_ORDERS=true and keys are set).
+strategy = "trend_qqq"
+# Keep some cash so rounding/price moves never cause a rejected order.
+cash_buffer = 0.02
+# Skip rebalancing trades smaller than this fraction of equity.
+min_trade_fraction = 0.01

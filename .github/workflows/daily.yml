@@ -1,0 +1,45 @@
+name: Daily report
+
+on:
+  schedule:
+    # 22:15 UTC Mon–Fri = after the US close all year (21:00 UTC in winter, 20:00 UTC in summer).
+    - cron: "15 22 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Report even if there is no new close"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read  # least privilege: the job never writes to the repo
+
+concurrency:
+  group: trading-bot
+  cancel-in-progress: false
+
+jobs:
+  daily:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: trading  # secrets are scoped to this environment
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Run daily report and paper orders
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          REPORT_TO: ${{ secrets.REPORT_TO }}
+          ALPACA_KEY_ID: ${{ secrets.ALPACA_KEY_ID }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          ENABLE_PAPER_ORDERS: ${{ vars.ENABLE_PAPER_ORDERS }}
+        run: python -m bot daily ${{ inputs.force && '--force' || '' }}
